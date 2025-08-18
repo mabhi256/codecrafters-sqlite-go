@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	// Available if you need it!
 	// "github.com/xwb1989/sqlparser"
 )
@@ -58,18 +59,34 @@ func main() {
 		log.Fatal(err)
 	}
 
-	switch command {
-	case ".dbinfo":
+	command = strings.TrimSpace(command)
+	command = strings.ToLower(command)
+
+	switch {
+	case command == ".dbinfo":
 		// fmt.Fprintln(os.Stderr, "Logs from your program will appear here!")
 		fmt.Printf("database page size: %v\n", pageSize)
 		fmt.Printf("number of tables: %v\n", cellCount)
 
-	case ".tables":
+	case command == ".tables":
 		for _, table := range tables {
 			fmt.Printf("%s ", table.Name)
 		}
 		fmt.Println()
 
+	case strings.HasPrefix(command, "select"):
+		parts := strings.Fields(command)
+
+		table, err := getTableByName(parts[len(parts)-1], tables)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		rowCount, err := table.getRowCount(databaseFile, pageSize)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(rowCount)
 	default:
 		fmt.Println("Unknown command", command)
 		os.Exit(1)
@@ -110,7 +127,7 @@ func getCellCount(dbFile *os.File) (uint16, error) {
 	// B-tree page header in the 1st page starts after DB file header
 	_, err := dbFile.ReadAt(header, DBFileHeaderSize)
 	if err != nil {
-		log.Fatal(err)
+		return 0, err
 	}
 
 	cellCount, err := getValueAtOffset(header, CellCountOffset, 2)
@@ -257,4 +274,31 @@ func getTablesList(dbFile *os.File, cellOffsets []uint16) ([]Table, error) {
 	}
 
 	return tables, nil
+}
+
+func getTableByName(name string, tables []Table) (*Table, error) {
+	for _, table := range tables {
+		if table.Name == name {
+			return &table, nil
+		}
+	}
+
+	return nil, fmt.Errorf("unable to find table: %s", name)
+}
+
+func (t *Table) getRowCount(dbFile *os.File, pageSize uint16) (uint16, error) {
+	header := make([]byte, BTreePageHeaderSize)
+
+	// B-tree page header of a table starts at the RootPage offset
+	_, err := dbFile.ReadAt(header, t.RootPage*int64(pageSize))
+	if err != nil {
+		return 0, err
+	}
+
+	rowCount, err := getValueAtOffset(header, CellCountOffset, 2)
+	if err != nil {
+		return 0, err
+	}
+
+	return rowCount, nil
 }
