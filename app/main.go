@@ -6,15 +6,21 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
-	// Available if you need it!
-	// "github.com/xwb1989/sqlparser"
 )
 
 type Table struct {
-	ID       int
-	Name     string
-	RootPage int64
+	ID        int
+	Name      string
+	RootPage  int64
+	Columns   []Column
+	RowsCount int
+}
+
+type Column struct {
+	Name string
+	Type string
 }
 
 const (
@@ -22,7 +28,7 @@ const (
 	BTreePageHeaderSize = 8
 	PageSizeOffset      = 16
 	CellCountOffset     = 3
-	CellPointerOffset   = 8
+	CellPointerOffset   = 8 // Assuming no interior pages
 
 	VARINT_CONTINUATION_MASK = 0x80 // 0b1000_0000
 	VARINT_VALUE_MASK        = 0x7F // 0b0111_1111
@@ -54,7 +60,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	tables, err := getTablesList(databaseFile, cellOffsets)
+	tables, err := getTablesList(databaseFile, cellOffsets, pageSize)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -74,7 +80,7 @@ func main() {
 		}
 		fmt.Println()
 
-	case strings.HasPrefix(command, "select"):
+	case strings.HasPrefix(command, "select count(*)"):
 		parts := strings.Fields(command)
 
 		table, err := getTableByName(parts[len(parts)-1], tables)
@@ -87,6 +93,27 @@ func main() {
 			log.Fatal(err)
 		}
 		fmt.Println(rowCount)
+
+	case strings.HasPrefix(command, "select"):
+		selectInfo, err := ParseSelect(command)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		table, err := getTableByName(selectInfo.TableName, tables)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		rows, err := table.getRows(databaseFile, pageSize, selectInfo.Columns[0])
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		for _, row := range rows {
+			fmt.Println(row)
+		}
+		fmt.Println()
 	default:
 		fmt.Println("Unknown command", command)
 		os.Exit(1)
@@ -170,14 +197,63 @@ func readVarint(dbFile *os.File, pos *int64) (int64, error) {
 	return num, nil
 }
 
-func decodeTextSize(serialType int64) int64 {
-	if serialType >= 12 && serialType%2 == 0 {
+func getSerialTypeContentSize(serialType int64) int64 {
+	isEven := serialType%2 == 0
+
+	if serialType >= 12 && isEven {
 		return (serialType - 12) / 2
 	} else if serialType >= 13 && serialType%2 != 0 {
 		return (serialType - 13) / 2
 	}
 
-	return 0
+	switch serialType {
+	case 0, 1, 2, 3, 4:
+		return serialType
+	case 5:
+		return 6
+	case 6, 7:
+		return 8
+	case 8, 9:
+		return 0
+	default:
+		return -1 // serial type 10, 11 is reserved for internal use and will never appear in the db file.
+	}
+}
+
+func bytesToInt(data []byte) int64 {
+	var result int64
+	for _, b := range data {
+		result = result<<8 + int64(b)
+	}
+	return result
+}
+
+func serialTypeToInt(serialType int64, data []byte) (int64, error) {
+	switch serialType {
+	case 0:
+		return 0, nil // NULL
+	case 1:
+		return int64(data[0]), nil // 8-bit (treat as unsigned for root pages)
+	case 2:
+		return int64(binary.BigEndian.Uint16(data)), nil // 16-bit
+	case 3:
+		// 24-bit - simple big-endian conversion
+		return int64(data[0])<<16 | int64(data[1])<<8 | int64(data[2]), nil
+	case 4:
+		return int64(binary.BigEndian.Uint32(data)), nil // 32-bit
+	case 5:
+		// 48-bit - simple big-endian conversion
+		val := int64(binary.BigEndian.Uint16(data[0:2]))<<32 | int64(binary.BigEndian.Uint32(data[2:6]))
+		return val, nil
+	case 6:
+		return int64(binary.BigEndian.Uint64(data)), nil // 64-bit
+	case 8:
+		return 0, nil // Constant 0
+	case 9:
+		return 1, nil // Constant 1
+	default:
+		return 0, fmt.Errorf("unsupported serial type: %d", serialType)
+	}
 }
 
 func getCellOffsets(dbFile *os.File, cellCount uint16) ([]uint16, error) {
@@ -199,7 +275,7 @@ func getCellOffsets(dbFile *os.File, cellCount uint16) ([]uint16, error) {
 	return cellOffsets, nil
 }
 
-func getTablesList(dbFile *os.File, cellOffsets []uint16) ([]Table, error) {
+func getTablesList(dbFile *os.File, cellOffsets []uint16, pageSize uint16) ([]Table, error) {
 	tables := []Table{}
 
 	for i, offset := range cellOffsets {
@@ -229,46 +305,77 @@ func getTablesList(dbFile *os.File, cellOffsets []uint16) ([]Table, error) {
 		}
 
 		// Serial type for sqlite_schema.type
-		schemaType, err := readVarint(dbFile, &pos)
+		schemaTypeSer, err := readVarint(dbFile, &pos)
 		if err != nil {
 			return nil, err
 		}
-		schemaTypeSize := decodeTextSize(schemaType)
+		schemaTypeSize := getSerialTypeContentSize(schemaTypeSer)
 
 		// Serial type for sqlite_schema.name
-		schemaName, err := readVarint(dbFile, &pos)
+		schemaNameSer, err := readVarint(dbFile, &pos)
 		if err != nil {
 			return nil, err
 		}
-		schemaNameSize := decodeTextSize(schemaName)
+		schemaNameSize := getSerialTypeContentSize(schemaNameSer)
 
 		// Serial type for sqlite_schema.tbl_name
-		schemaTableName, err := readVarint(dbFile, &pos)
+		schemaTableNameSer, err := readVarint(dbFile, &pos)
 		if err != nil {
 			return nil, err
 		}
-		schemaTableNameSize := decodeTextSize(schemaTableName)
+		schemaTableNameSize := getSerialTypeContentSize(schemaTableNameSer)
 
 		// Serial type for sqlite_schema.rootpage
 		schemaRoot, err := readVarint(dbFile, &pos)
 		if err != nil {
 			return nil, err
 		}
-		table.RootPage = schemaRoot
+		schemaRootSize := getSerialTypeContentSize(schemaRoot)
 
-		// // Serial type for sqlite_schema.sql
-		// schemaSql, err := readVarint(databaseFile, &pos)
-		// if err != nil {
-		// 	log.Fatal(err)
-		// }
-
-		tableNameOffset := startOfRecord + recordHeaderSize + schemaTypeSize + schemaNameSize
-		tableName := make([]byte, schemaTableNameSize)
-		_, err = dbFile.ReadAt(tableName, tableNameOffset)
+		// Serial type for sqlite_schema.sql
+		schemaSqlSer, err := readVarint(dbFile, &pos)
 		if err != nil {
 			return nil, err
 		}
-		table.Name = string(tableName)
+		schemaSqlSize := getSerialTypeContentSize(schemaSqlSer)
+
+		// get table name
+		tableNameOffset := startOfRecord + recordHeaderSize + schemaTypeSize + schemaNameSize
+		tableNameBytes := make([]byte, schemaTableNameSize)
+		_, err = dbFile.ReadAt(tableNameBytes, tableNameOffset)
+		if err != nil {
+			return nil, err
+		}
+		table.Name = string(tableNameBytes)
+
+		// get table rootpage
+		schemaRootOffset := tableNameOffset + schemaTableNameSize
+		rootPageBytes := make([]byte, schemaRootSize)
+		_, err = dbFile.ReadAt(rootPageBytes, schemaRootOffset)
+		if err != nil {
+			return nil, err
+		}
+
+		rootPageValue := bytesToInt(rootPageBytes)
+		table.RootPage = rootPageValue
+
+		// get table sql
+		schemaSqlOffset := schemaRootOffset + schemaRootSize
+		schemaSqlBytes := make([]byte, schemaSqlSize)
+		_, err = dbFile.ReadAt(schemaSqlBytes, schemaSqlOffset)
+		if err != nil {
+			return nil, err
+		}
+
+		if table.Name != "sqlite_sequence" {
+			table.ParseCreateTable(string(schemaSqlBytes))
+		}
+
+		rowCount, err := table.getRowCount(dbFile, pageSize)
+		if err != nil {
+			return nil, err
+		}
+		table.RowsCount = int(rowCount)
 
 		tables = append(tables, table)
 	}
@@ -286,11 +393,12 @@ func getTableByName(name string, tables []Table) (*Table, error) {
 	return nil, fmt.Errorf("unable to find table: %s", name)
 }
 
+// Assuming single page
 func (t *Table) getRowCount(dbFile *os.File, pageSize uint16) (uint16, error) {
 	header := make([]byte, BTreePageHeaderSize)
 
 	// B-tree page header of a table starts at the RootPage offset
-	_, err := dbFile.ReadAt(header, t.RootPage*int64(pageSize))
+	_, err := dbFile.ReadAt(header, (t.RootPage-1)*int64(pageSize)) // RootPage is 1 indexed
 	if err != nil {
 		return 0, err
 	}
@@ -301,4 +409,82 @@ func (t *Table) getRowCount(dbFile *os.File, pageSize uint16) (uint16, error) {
 	}
 
 	return rowCount, nil
+}
+
+func (t *Table) getRows(dbFile *os.File, pageSize uint16, columnName string) ([]string, error) {
+	cellPointerArray := make([]byte, 2*t.RowsCount)
+
+	// B-tree page header of a table starts at the RootPage offset
+	rootPageOffset := (t.RootPage - 1) * int64(pageSize) // RootPage is 1 indexed
+	_, err := dbFile.ReadAt(cellPointerArray, rootPageOffset+CellPointerOffset)
+	if err != nil {
+		return nil, err
+	}
+
+	cellOffsets := make([]uint16, t.RowsCount)
+	for i := range t.RowsCount {
+		offset, err := getValueAtOffset(cellPointerArray, int(2*i), 2)
+		if err != nil {
+			return nil, err
+		}
+		cellOffsets[i] = offset
+	}
+
+	rows := []string{}
+
+	for _, offset := range cellOffsets {
+		pos := rootPageOffset + int64(offset)
+
+		// Size of the record
+		_, err := readVarint(dbFile, &pos)
+		if err != nil {
+			return nil, err
+		}
+
+		// rowId
+		_, err = readVarint(dbFile, &pos)
+		if err != nil {
+			return nil, err
+		}
+
+		// Record header
+		// Size of record header
+		startOfRecord := pos
+		recordHeaderSize, err := readVarint(dbFile, &pos)
+		if err != nil {
+			return nil, err
+		}
+
+		columnOffset := startOfRecord + recordHeaderSize
+		// println(columnOffset)
+		for _, column := range t.Columns {
+			// Serial type for sqlite_schema.type
+			schemaTypeSer, err := readVarint(dbFile, &pos)
+			if err != nil {
+				return nil, err
+			}
+			schemaTypeSize := getSerialTypeContentSize(schemaTypeSer)
+			// fmt.Printf("Column: %s, schemaType: %v, schemaTypeSize: %d\n", column.Name, schemaTypeSer, schemaTypeSize)
+
+			if column.Name == columnName {
+				valueBytes := make([]byte, schemaTypeSize)
+				_, err = dbFile.ReadAt(valueBytes, columnOffset)
+				if err != nil {
+					return nil, err
+				}
+				value := ""
+				if column.Type == "integer" {
+					valueInt := bytesToInt(valueBytes)
+					value = strconv.Itoa(int(valueInt))
+				} else if column.Type == "text" {
+					value = string(valueBytes)
+				}
+				rows = append(rows, value)
+				break
+			}
+			columnOffset += schemaTypeSize
+		}
+	}
+
+	return rows, nil
 }
