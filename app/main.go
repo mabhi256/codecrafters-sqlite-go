@@ -105,7 +105,7 @@ func main() {
 			log.Fatal(err)
 		}
 
-		rows, err := table.getRows(databaseFile, pageSize, selectInfo.Columns[0])
+		rows, err := table.getRows(databaseFile, pageSize, selectInfo.Columns)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -411,7 +411,7 @@ func (t *Table) getRowCount(dbFile *os.File, pageSize uint16) (uint16, error) {
 	return rowCount, nil
 }
 
-func (t *Table) getRows(dbFile *os.File, pageSize uint16, columnName string) ([]string, error) {
+func (t *Table) getRows(dbFile *os.File, pageSize uint16, columnNames []string) ([]string, error) {
 	cellPointerArray := make([]byte, 2*t.RowsCount)
 
 	// B-tree page header of a table starts at the RootPage offset
@@ -457,6 +457,8 @@ func (t *Table) getRows(dbFile *os.File, pageSize uint16, columnName string) ([]
 
 		columnOffset := startOfRecord + recordHeaderSize
 		// println(columnOffset)
+		values := make([]string, len(columnNames))
+
 		for _, column := range t.Columns {
 			// Serial type for sqlite_schema.type
 			schemaTypeSer, err := readVarint(dbFile, &pos)
@@ -466,24 +468,26 @@ func (t *Table) getRows(dbFile *os.File, pageSize uint16, columnName string) ([]
 			schemaTypeSize := getSerialTypeContentSize(schemaTypeSer)
 			// fmt.Printf("Column: %s, schemaType: %v, schemaTypeSize: %d\n", column.Name, schemaTypeSer, schemaTypeSize)
 
-			if column.Name == columnName {
-				valueBytes := make([]byte, schemaTypeSize)
-				_, err = dbFile.ReadAt(valueBytes, columnOffset)
-				if err != nil {
-					return nil, err
+			for i, columnName := range columnNames {
+				if column.Name == columnName {
+					valueBytes := make([]byte, schemaTypeSize)
+					_, err = dbFile.ReadAt(valueBytes, columnOffset)
+					if err != nil {
+						return nil, err
+					}
+					if column.Type == "integer" {
+						valueInt := bytesToInt(valueBytes)
+						values[i] = strconv.Itoa(int(valueInt))
+					} else if column.Type == "text" {
+						values[i] = string(valueBytes)
+					}
+					break
 				}
-				value := ""
-				if column.Type == "integer" {
-					valueInt := bytesToInt(valueBytes)
-					value = strconv.Itoa(int(valueInt))
-				} else if column.Type == "text" {
-					value = string(valueBytes)
-				}
-				rows = append(rows, value)
-				break
+
 			}
 			columnOffset += schemaTypeSize
 		}
+		rows = append(rows, strings.Join(values, "|"))
 	}
 
 	return rows, nil
