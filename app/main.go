@@ -19,8 +19,9 @@ type Table struct {
 }
 
 type Column struct {
-	Name string
-	Type string
+	Name     string
+	Type     string
+	ValueStr string
 }
 
 const (
@@ -105,7 +106,8 @@ func main() {
 			log.Fatal(err)
 		}
 
-		rows, err := table.getRows(databaseFile, pageSize, selectInfo.Columns)
+		selectInfo.WhereValue = strings.ReplaceAll(selectInfo.WhereValue, "'", "")
+		rows, err := table.getRows(databaseFile, pageSize, selectInfo)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -411,7 +413,7 @@ func (t *Table) getRowCount(dbFile *os.File, pageSize uint16) (uint16, error) {
 	return rowCount, nil
 }
 
-func (t *Table) getRows(dbFile *os.File, pageSize uint16, columnNames []string) ([]string, error) {
+func (t *Table) getRows(dbFile *os.File, pageSize uint16, selectInfo *SelectInfo) ([]string, error) {
 	cellPointerArray := make([]byte, 2*t.RowsCount)
 
 	// B-tree page header of a table starts at the RootPage offset
@@ -457,7 +459,8 @@ func (t *Table) getRows(dbFile *os.File, pageSize uint16, columnNames []string) 
 
 		columnOffset := startOfRecord + recordHeaderSize
 		// println(columnOffset)
-		values := make([]string, len(columnNames))
+		values := make([]string, len(selectInfo.Columns))
+		var whereCondition bool
 
 		for _, column := range t.Columns {
 			// Serial type for sqlite_schema.type
@@ -468,26 +471,37 @@ func (t *Table) getRows(dbFile *os.File, pageSize uint16, columnNames []string) 
 			schemaTypeSize := getSerialTypeContentSize(schemaTypeSer)
 			// fmt.Printf("Column: %s, schemaType: %v, schemaTypeSize: %d\n", column.Name, schemaTypeSer, schemaTypeSize)
 
-			for i, columnName := range columnNames {
+			valueBytes := make([]byte, schemaTypeSize)
+			_, err = dbFile.ReadAt(valueBytes, columnOffset)
+			if err != nil {
+				return nil, err
+			}
+
+			if column.Type == "integer" {
+				valueInt := bytesToInt(valueBytes)
+				column.ValueStr = strconv.Itoa(int(valueInt))
+			} else if column.Type == "text" {
+				column.ValueStr = string(valueBytes)
+			}
+
+			if column.Name == selectInfo.WhereColumn {
+				if strings.EqualFold(column.ValueStr, selectInfo.WhereValue) {
+					whereCondition = true
+				}
+			}
+
+			for i, columnName := range selectInfo.Columns {
 				if column.Name == columnName {
-					valueBytes := make([]byte, schemaTypeSize)
-					_, err = dbFile.ReadAt(valueBytes, columnOffset)
-					if err != nil {
-						return nil, err
-					}
-					if column.Type == "integer" {
-						valueInt := bytesToInt(valueBytes)
-						values[i] = strconv.Itoa(int(valueInt))
-					} else if column.Type == "text" {
-						values[i] = string(valueBytes)
-					}
+					values[i] = column.ValueStr
 					break
 				}
-
 			}
 			columnOffset += schemaTypeSize
 		}
-		rows = append(rows, strings.Join(values, "|"))
+
+		if selectInfo.WhereColumn == "" || whereCondition {
+			rows = append(rows, strings.Join(values, "|"))
+		}
 	}
 
 	return rows, nil
