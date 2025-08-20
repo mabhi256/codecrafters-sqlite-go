@@ -33,8 +33,9 @@ func (t *Table) ParseCreateTable(command string) error {
 
 	if ddl.TableSpec != nil {
 		for _, col := range ddl.TableSpec.Columns {
+			colName := col.Name.String()
 			t.Columns = append(t.Columns, Column{
-				Name: col.Name.String(),
+				Name: colName,
 				Type: col.Type.Type,
 			})
 		}
@@ -49,6 +50,7 @@ type SelectInfo struct {
 	WhereColumn   string
 	WhereValue    string
 	WhereOperator string
+	IsCount       bool
 }
 
 func ParseSelect(command string) (*SelectInfo, error) {
@@ -63,11 +65,28 @@ func ParseSelect(command string) (*SelectInfo, error) {
 	}
 	selectInfo := &SelectInfo{}
 
-	// Get columns (assume explicit columns only, no *)
+	// Get columns - handle SELECT COUNT(*), SELECT *, and SELECT col1, col2, ...
 	for _, expr := range sel.SelectExprs {
-		aliasedExpr := expr.(*sqlparser.AliasedExpr)
-		colName := sqlparser.String(aliasedExpr.Expr)
-		selectInfo.Columns = append(selectInfo.Columns, colName)
+		switch e := expr.(type) {
+		case *sqlparser.AliasedExpr:
+			if funcExpr, ok := e.Expr.(*sqlparser.FuncExpr); ok &&
+				strings.ToLower(funcExpr.Name.String()) == "count" {
+				// Check if it's COUNT(*)
+				selectInfo.IsCount = true
+				selectInfo.Columns = append(selectInfo.Columns, "count(*)")
+			} else {
+				// Explicit column: SELECT col1, col2, ...
+				colName := sqlparser.String(e.Expr)
+				selectInfo.Columns = append(selectInfo.Columns, colName)
+			}
+		case *sqlparser.StarExpr:
+			// Handle SELECT *
+			selectInfo.Columns = append(selectInfo.Columns, "*")
+		default:
+			// Handle other expression types
+			colName := sqlparser.String(e)
+			selectInfo.Columns = append(selectInfo.Columns, colName)
+		}
 	}
 
 	// Get table name (assume single table query)

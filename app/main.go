@@ -1,205 +1,330 @@
 package main
 
 import (
-	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"log"
+	"math"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 )
 
+type DBContext struct {
+	DBFile   *os.File
+	PageSize uint16
+	Tables   []Table
+}
+
+type BTreePageData struct {
+	PageHeader  []byte
+	PageOffset  int64
+	CellOffsets []uint16
+	CellCount   uint16
+}
+
 type Table struct {
-	ID        int
-	Name      string
-	RootPage  int64
-	Columns   []Column
-	RowsCount int
+	ID       int
+	Name     string
+	RootPage int64
+	Columns  []Column
 }
 
 type Column struct {
-	Name     string
-	Type     string
-	ValueStr string
+	Name string
+	Type string
 }
 
 const (
-	DBFileHeaderSize    = 100
-	BTreePageHeaderSize = 8
-	PageSizeOffset      = 16
-	CellCountOffset     = 3
-	CellPointerOffset   = 8 // Assuming no interior pages
+	DBFileHeaderSize = 100
+	// BTreePageHeaderSize = 8 // 12 for interior
+	PageSizeOffset  = 16
+	CellCountOffset = 3
+	//CellPointerOffset   = 8 // Assuming no interior pages
 
 	VARINT_CONTINUATION_MASK = 0x80 // 0b1000_0000
 	VARINT_VALUE_MASK        = 0x7F // 0b0111_1111
 	MaxVarintBytes           = 9
 )
 
-// Usage: your_program.sh sample.db .dbinfo
-func main() {
-	databaseFilePath := os.Args[1]
-	command := os.Args[2]
-
-	databaseFile, err := os.Open(databaseFilePath)
+func initializeDB(dbFilePath string) (*DBContext, error) {
+	dbFile, err := os.Open(dbFilePath)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 
-	pageSize, err := getPageSize(databaseFile)
+	dbFileHeader, err := getDBFileHeader(dbFile)
 	if err != nil {
-		log.Fatal(err)
+		dbFile.Close()
+		return nil, err
 	}
 
-	cellCount, err := getCellCount(databaseFile)
+	pageSize := getUint16AtOffset(dbFileHeader, PageSizeOffset)
+
+	tables, err := processSchemaPage(dbFile, pageSize)
 	if err != nil {
-		log.Fatal(err)
+		dbFile.Close()
+		return nil, err
 	}
 
-	cellOffsets, err := getCellOffsets(databaseFile, cellCount)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	tables, err := getTablesList(databaseFile, cellOffsets, pageSize)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	command = strings.TrimSpace(command)
-	command = strings.ToLower(command)
-
-	switch {
-	case command == ".dbinfo":
-		// fmt.Fprintln(os.Stderr, "Logs from your program will appear here!")
-		fmt.Printf("database page size: %v\n", pageSize)
-		fmt.Printf("number of tables: %v\n", cellCount)
-
-	case command == ".tables":
-		for _, table := range tables {
-			fmt.Printf("%s ", table.Name)
-		}
-		fmt.Println()
-
-	case strings.HasPrefix(command, "select count(*)"):
-		parts := strings.Fields(command)
-
-		table, err := getTableByName(parts[len(parts)-1], tables)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		rowCount, err := table.getRowCount(databaseFile, pageSize)
-		if err != nil {
-			log.Fatal(err)
-		}
-		fmt.Println(rowCount)
-
-	case strings.HasPrefix(command, "select"):
-		selectInfo, err := ParseSelect(command)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		table, err := getTableByName(selectInfo.TableName, tables)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		selectInfo.WhereValue = strings.ReplaceAll(selectInfo.WhereValue, "'", "")
-		rows, err := table.getRows(databaseFile, pageSize, selectInfo)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		for _, row := range rows {
-			fmt.Println(row)
-		}
-		fmt.Println()
-	default:
-		fmt.Println("Unknown command", command)
-		os.Exit(1)
-	}
+	return &DBContext{
+		DBFile:   dbFile,
+		PageSize: pageSize,
+		Tables:   tables,
+	}, nil
 }
 
-func getValueAtOffset(header []byte, offset, size int) (uint16, error) {
-	var value uint16
-	valueRaw := bytes.NewReader(header[offset : offset+size])
-
-	err := binary.Read(valueRaw, binary.BigEndian, &value)
-	if err != nil {
-		return 0, err
-	}
-
-	return value, nil
-}
-
-func getPageSize(dbFile *os.File) (uint16, error) {
+func getDBFileHeader(dbFile *os.File) ([]byte, error) {
+	// Always read first 100 bytes from offset 0
 	header := make([]byte, DBFileHeaderSize)
 
 	_, err := dbFile.Read(header)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
-	pageSize, err := getValueAtOffset(header, PageSizeOffset, 2)
-	if err != nil {
-		return 0, err
-	}
-
-	return pageSize, nil
+	return header, nil
 }
 
-func getCellCount(dbFile *os.File) (uint16, error) {
-	header := make([]byte, BTreePageHeaderSize)
-
-	// B-tree page header in the 1st page starts after DB file header
-	_, err := dbFile.ReadAt(header, DBFileHeaderSize)
+func getBTreePageHeader(dbFile *os.File, pageNumber int64, pageSize uint16) ([]byte, error) {
+	// Read the maximum possible header size (12 bytes)
+	header := make([]byte, 12)
+	offset := getPageOffset(pageNumber, pageSize)
+	_, err := dbFile.ReadAt(header, offset)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
-	cellCount, err := getValueAtOffset(header, CellCountOffset, 2)
-	if err != nil {
-		return 0, err
+	pageType := header[0]
+	switch pageType {
+	case 0x02, 0x05: // Interior index/table pages
+		return header, nil // Return all 12 bytes
+	case 0x0a, 0x0d: // Leaf index/table pages
+		return header[:8], nil // Return only first 8 bytes
+	default:
+		return nil, fmt.Errorf("invalid page type: 0x%02x", pageType)
+	}
+}
+
+func getPageOffset(pageNumber int64, pageSize uint16) int64 {
+	var offset int64
+	if pageNumber == 1 {
+		offset = DBFileHeaderSize // Page 1 starts after DB header
+	} else {
+		offset = (pageNumber - 1) * int64(pageSize) // Other pages start after the previous page
 	}
 
-	return cellCount, nil
+	return offset
+}
+
+// Assuming it will not overflow
+func getUint16AtOffset(b []byte, offset uint16) uint16 {
+	return binary.BigEndian.Uint16(b[offset : offset+2])
+}
+
+func getBTreePageData(dbFile *os.File, pageNumber int64, pageSize uint16) (*BTreePageData, error) {
+	pageHeader, err := getBTreePageHeader(dbFile, pageNumber, pageSize)
+	if err != nil {
+		return nil, err
+	}
+
+	cellCount := getUint16AtOffset(pageHeader, CellCountOffset)
+	pageOffset := getPageOffset(pageNumber, pageSize)
+	cellPointerArrayOffset := pageOffset + int64(len(pageHeader))
+
+	cellOffsets, err := getCellOffsets(dbFile, cellPointerArrayOffset, cellCount)
+	if err != nil {
+		return nil, err
+	}
+
+	return &BTreePageData{
+		PageHeader:  pageHeader,
+		PageOffset:  pageOffset,
+		CellOffsets: cellOffsets,
+		CellCount:   cellCount,
+	}, nil
+}
+
+func processSchemaPage(dbFile *os.File, pageSize uint16) ([]Table, error) {
+	pageData, err := getBTreePageData(dbFile, 1, pageSize) // Schema is always on page 1
+	if err != nil {
+		return nil, err
+	}
+
+	tables, err := parseSchemaEntries(dbFile, pageData.CellOffsets)
+	if err != nil {
+		return nil, err
+	}
+
+	return tables, nil
+}
+
+func handleSelectRows(ctx *DBContext, selectInfo *SelectInfo) {
+	table, err := getTableByName(selectInfo.TableName, ctx.Tables)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	pageData, err := getBTreePageData(ctx.DBFile, table.RootPage, ctx.PageSize)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	rows, err := table.fetchTableRows(ctx.DBFile, pageData, selectInfo)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	for _, row := range rows {
+		fmt.Println(row)
+	}
+}
+
+func getCellOffsets(dbFile *os.File,
+	cellPointerArrayOffset int64, cellCount uint16,
+) (cellOffsets []uint16, err error) {
+	cellPointerArray := make([]byte, 2*cellCount)
+	_, err = dbFile.ReadAt(cellPointerArray, cellPointerArrayOffset)
+	if err != nil {
+		return nil, err
+	}
+
+	cellOffsets = make([]uint16, cellCount)
+	for i := range cellCount {
+		offset := getUint16AtOffset(cellPointerArray, 2*i)
+		cellOffsets[i] = offset
+	}
+
+	return cellOffsets, nil
+}
+
+func readCell(dbFile *os.File,
+	cellOffset int64, columns []Column, selectInfo *SelectInfo,
+) (map[string]string, error) {
+	pos := cellOffset
+
+	// Cell structure: record size + rowid + record data
+	_, err := readVarint(dbFile, &pos) // record size
+	if err != nil {
+		return nil, err
+	}
+	_, err = readVarint(dbFile, &pos) // rowId
+	if err != nil {
+		return nil, err
+	}
+
+	// Record structure: header size + column-wise serial types  + column-wise data
+	startOfRecord := pos
+	recordHeaderSize, err := readVarint(dbFile, &pos)
+	if err != nil {
+		return nil, err
+	}
+
+	// Read serial types for all columns and calculate offsets
+	serialTypes := make([]int64, len(columns))
+	columnOffsets := make([]int64, len(columns))
+	currentOffset := startOfRecord + recordHeaderSize
+	for i := range columns {
+		serialType, err := readVarint(dbFile, &pos)
+		if err != nil {
+			return nil, err
+		}
+		serialTypes[i] = serialType
+		columnOffsets[i] = currentOffset
+		currentOffset += getContentSizeBySerialType(serialType)
+	}
+
+	// Add where-column to requested columns if not already present in select-columns
+	// select col1, col2 from table1 where col3 = x;
+	requestedColumns := selectInfo.Columns
+	if selectInfo.WhereColumn != "" {
+		found := slices.Contains(selectInfo.Columns, selectInfo.WhereColumn)
+		if !found {
+			requestedColumns = append(requestedColumns, selectInfo.WhereColumn)
+		}
+	}
+
+	// Read requested columns
+	result := make(map[string]string)
+	for _, requestedCol := range requestedColumns {
+		colIndex := -1
+		for i, col := range columns {
+			if col.Name == requestedCol {
+				colIndex = i
+				break
+			}
+		}
+		if colIndex == -1 {
+			continue
+		}
+
+		value, err := readColumnValue(dbFile, columnOffsets[colIndex], serialTypes[colIndex])
+		if err != nil {
+			return nil, err
+		}
+		result[requestedCol] = value
+	}
+
+	// Apply WHERE filter
+	if selectInfo.WhereColumn != "" {
+		if !strings.EqualFold(result[selectInfo.WhereColumn], selectInfo.WhereValue) {
+			return nil, nil // filtered out - return empty map
+		}
+	}
+
+	return result, nil
 }
 
 func readVarint(dbFile *os.File, pos *int64) (int64, error) {
 	var num int64
-	size := 1 // number of bytes used by varint
-	b := make([]byte, 1)
+	b := make([]byte, 1) // reuse the same buffer
 
-	for {
+	for i := range MaxVarintBytes {
 		_, err := dbFile.ReadAt(b, *pos)
 		if err != nil {
 			return 0, fmt.Errorf("unable to read varint: %w", err)
 		}
 
 		currentByte := b[0]
-		currentValue := currentByte & VARINT_VALUE_MASK
-		num = num<<7 | int64(currentValue)
-
-		//check continuation bit
-		if (currentByte & VARINT_CONTINUATION_MASK) == VARINT_CONTINUATION_MASK {
-			*pos++
-			size++
+		var value byte
+		if i == 9 {
+			// all 8 bits of the ninth byte are used for reconstruction
+			value = currentByte
 		} else {
-			break
+			// lower 7 bits of the first eight bytes are used for reconstruction
+			value = currentByte & VARINT_VALUE_MASK
+		}
+		num = num<<7 | int64(value)
+		*pos++
+
+		// If continuation bit is not set, we're done
+		if (currentByte & VARINT_CONTINUATION_MASK) == 0 {
+			return num, nil
 		}
 	}
 
-	if size > MaxVarintBytes {
-		return 0, fmt.Errorf("varint too long: %d bytes", size)
-	}
-
-	*pos++ // Point to next unread byte
-	return num, nil
+	return 0, fmt.Errorf("varint too long: %d bytes", MaxVarintBytes)
 }
 
-func getSerialTypeContentSize(serialType int64) int64 {
+func readColumnValue(dbFile *os.File, offset int64, serialType int64) (string, error) {
+	size := getContentSizeBySerialType(serialType)
+	valueBytes := make([]byte, size)
+	_, err := dbFile.ReadAt(valueBytes, offset)
+	if err != nil {
+		return "", err
+	}
+
+	value, err := serialTypeToValue(serialType, valueBytes)
+	if err != nil {
+		return "", err
+	}
+
+	return valueToString(value), nil
+}
+
+func getContentSizeBySerialType(serialType int64) int64 {
 	isEven := serialType%2 == 0
 
 	if serialType >= 12 && isEven {
@@ -222,167 +347,166 @@ func getSerialTypeContentSize(serialType int64) int64 {
 	}
 }
 
-func bytesToInt(data []byte) int64 {
-	var result int64
-	for _, b := range data {
-		result = result<<8 + int64(b)
-	}
-	return result
-}
-
-func serialTypeToInt(serialType int64, data []byte) (int64, error) {
+func serialTypeToValue(serialType int64, data []byte) (any, error) {
 	switch serialType {
 	case 0:
-		return 0, nil // NULL
+		return nil, nil // NULL
 	case 1:
-		return int64(data[0]), nil // 8-bit (treat as unsigned for root pages)
+		// 8-bit signed integer
+		return int8(data[0]), nil
 	case 2:
-		return int64(binary.BigEndian.Uint16(data)), nil // 16-bit
+		// 16-bit signed integer (big-endian)
+		return int16(binary.BigEndian.Uint16(data)), nil
 	case 3:
-		// 24-bit - simple big-endian conversion
-		return int64(data[0])<<16 | int64(data[1])<<8 | int64(data[2]), nil
+		// 24-bit signed integer (big-endian)
+		value := int32(data[0])<<16 | int32(data[1])<<8 | int32(data[2])
+		return (value << 8) >> 8, nil // Extend sign if negative
 	case 4:
-		return int64(binary.BigEndian.Uint32(data)), nil // 32-bit
+		// 32-bit signed integer (big-endian)
+		return int32(binary.BigEndian.Uint32(data)), nil
 	case 5:
-		// 48-bit - simple big-endian conversion
-		val := int64(binary.BigEndian.Uint16(data[0:2]))<<32 | int64(binary.BigEndian.Uint32(data[2:6]))
-		return val, nil
+		// 48-bit signed integer (big-endian)
+		value := int64(binary.BigEndian.Uint16(data[0:2]))<<32 | int64(binary.BigEndian.Uint32(data[2:6]))
+		return (value << 16) >> 16, nil // Extend sign if negative
 	case 6:
-		return int64(binary.BigEndian.Uint64(data)), nil // 64-bit
+		// 64-bit signed integer (big-endian)
+		return int64(binary.BigEndian.Uint64(data)), nil
+	case 7:
+		// 64-bit IEEE floating point (big-endian)
+		bits := binary.BigEndian.Uint64(data)
+		return math.Float64frombits(bits), nil
 	case 8:
-		return 0, nil // Constant 0
+		return int8(0), nil // Integer constant 0
 	case 9:
-		return 1, nil // Constant 1
+		return int8(1), nil // Integer constant 1
+	case 10, 11:
+		return nil, fmt.Errorf("reserved serial types 10 and 11")
 	default:
-		return 0, fmt.Errorf("unsupported serial type: %d", serialType)
-	}
-}
-
-func getCellOffsets(dbFile *os.File, cellCount uint16) ([]uint16, error) {
-	cellPointerArray := make([]byte, 2*cellCount)
-	_, err := dbFile.ReadAt(cellPointerArray, DBFileHeaderSize+CellPointerOffset)
-	if err != nil {
-		return nil, err
-	}
-
-	cellOffsets := make([]uint16, cellCount)
-	for i := range cellCount {
-		offset, err := getValueAtOffset(cellPointerArray, int(2*i), 2)
-		if err != nil {
-			return nil, err
+		if serialType >= 12 && serialType%2 == 0 {
+			// BLOB: (N-12)/2 bytes
+			return data, nil // Return as []byte
+		} else if serialType >= 13 && serialType%2 == 1 {
+			// TEXT: (N-13)/2 bytes (UTF-8)
+			return string(data), nil
 		}
-		cellOffsets[i] = offset
+		return nil, fmt.Errorf("unsupported serial type: %d", serialType)
 	}
-
-	return cellOffsets, nil
 }
 
-func getTablesList(dbFile *os.File, cellOffsets []uint16, pageSize uint16) ([]Table, error) {
-	tables := []Table{}
+func valueToString(value any) string {
+	if value == nil {
+		return ""
+	}
 
+	switch v := value.(type) {
+	case string:
+		return v
+	case []byte:
+		return hex.EncodeToString(v)
+	case int8, int16, int32, int64:
+		return fmt.Sprintf("%d", v)
+	case float64:
+		return fmt.Sprintf("%g", v)
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+func parseSchemaEntries(dbFile *os.File, cellOffsets []uint16) ([]Table, error) {
+	sqliteMasterColumns := []Column{
+		{Name: "type", Type: "text"},
+		{Name: "name", Type: "text"},
+		{Name: "tbl_name", Type: "text"},
+		{Name: "rootpage", Type: "integer"},
+		{Name: "sql", Type: "text"},
+	}
+
+	schemaSelectInfo := &SelectInfo{
+		Columns:     []string{"tbl_name", "rootpage", "sql"},
+		WhereColumn: "type",
+		WhereValue:  "table",
+	}
+
+	var tables []Table
 	for i, offset := range cellOffsets {
-		pos := int64(offset)
+		values, err := readCell(dbFile, int64(offset), sqliteMasterColumns, schemaSelectInfo)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(values) == 0 { // filtered out
+			continue
+		}
+
 		table := Table{
-			ID: i,
+			ID:   i,
+			Name: values["tbl_name"],
 		}
 
-		// Size of the record
-		_, err := readVarint(dbFile, &pos)
-		if err != nil {
-			return nil, err
-		}
-
-		// rowId
-		_, err = readVarint(dbFile, &pos)
-		if err != nil {
-			return nil, err
-		}
-
-		// Record header
-		// Size of record header
-		startOfRecord := pos
-		recordHeaderSize, err := readVarint(dbFile, &pos)
-		if err != nil {
-			return nil, err
-		}
-
-		// Serial type for sqlite_schema.type
-		schemaTypeSer, err := readVarint(dbFile, &pos)
-		if err != nil {
-			return nil, err
-		}
-		schemaTypeSize := getSerialTypeContentSize(schemaTypeSer)
-
-		// Serial type for sqlite_schema.name
-		schemaNameSer, err := readVarint(dbFile, &pos)
-		if err != nil {
-			return nil, err
-		}
-		schemaNameSize := getSerialTypeContentSize(schemaNameSer)
-
-		// Serial type for sqlite_schema.tbl_name
-		schemaTableNameSer, err := readVarint(dbFile, &pos)
-		if err != nil {
-			return nil, err
-		}
-		schemaTableNameSize := getSerialTypeContentSize(schemaTableNameSer)
-
-		// Serial type for sqlite_schema.rootpage
-		schemaRoot, err := readVarint(dbFile, &pos)
-		if err != nil {
-			return nil, err
-		}
-		schemaRootSize := getSerialTypeContentSize(schemaRoot)
-
-		// Serial type for sqlite_schema.sql
-		schemaSqlSer, err := readVarint(dbFile, &pos)
-		if err != nil {
-			return nil, err
-		}
-		schemaSqlSize := getSerialTypeContentSize(schemaSqlSer)
-
-		// get table name
-		tableNameOffset := startOfRecord + recordHeaderSize + schemaTypeSize + schemaNameSize
-		tableNameBytes := make([]byte, schemaTableNameSize)
-		_, err = dbFile.ReadAt(tableNameBytes, tableNameOffset)
-		if err != nil {
-			return nil, err
-		}
-		table.Name = string(tableNameBytes)
-
-		// get table rootpage
-		schemaRootOffset := tableNameOffset + schemaTableNameSize
-		rootPageBytes := make([]byte, schemaRootSize)
-		_, err = dbFile.ReadAt(rootPageBytes, schemaRootOffset)
-		if err != nil {
-			return nil, err
-		}
-
-		rootPageValue := bytesToInt(rootPageBytes)
-		table.RootPage = rootPageValue
-
-		// get table sql
-		schemaSqlOffset := schemaRootOffset + schemaRootSize
-		schemaSqlBytes := make([]byte, schemaSqlSize)
-		_, err = dbFile.ReadAt(schemaSqlBytes, schemaSqlOffset)
-		if err != nil {
-			return nil, err
-		}
+		rootPageInt, _ := strconv.ParseInt(values["rootpage"], 10, 64)
+		table.RootPage = rootPageInt
 
 		if table.Name != "sqlite_sequence" {
-			table.ParseCreateTable(string(schemaSqlBytes))
+			table.ParseCreateTable(values["sql"])
 		}
-
-		rowCount, err := table.getRowCount(dbFile, pageSize)
-		if err != nil {
-			return nil, err
-		}
-		table.RowsCount = int(rowCount)
 
 		tables = append(tables, table)
 	}
 
 	return tables, nil
+}
+
+func (t *Table) fetchTableRows(dbFile *os.File, pageData *BTreePageData, selectInfo *SelectInfo) ([]string, error) {
+	var rows []string
+
+	for _, cellOffset := range pageData.CellOffsets {
+		offset := pageData.PageOffset + int64(cellOffset)
+		values, err := readCell(dbFile, offset, t.Columns, selectInfo)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(values) == 0 { // filtered out by WHERE clause
+			continue
+		}
+
+		// Build result string from requested columns
+		resultValues := make([]string, len(selectInfo.Columns))
+		for i, columnName := range selectInfo.Columns {
+			resultValues[i] = values[columnName]
+		}
+
+		rows = append(rows, strings.Join(resultValues, "|"))
+	}
+
+	return rows, nil
+}
+
+func handleSelect(ctx *DBContext, command string) {
+	selectInfo, err := ParseSelect(command)
+	if err != nil {
+		log.Fatal(err)
+	}
+	selectInfo.WhereValue = strings.ReplaceAll(selectInfo.WhereValue, "'", "")
+
+	if selectInfo.IsCount {
+		handleSelectCount(ctx, selectInfo)
+	} else {
+		handleSelectRows(ctx, selectInfo)
+	}
+}
+
+func handleSelectCount(ctx *DBContext, selectInfo *SelectInfo) {
+	table, err := getTableByName(selectInfo.TableName, ctx.Tables)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	tablePageHeader, err := getBTreePageHeader(ctx.DBFile, table.RootPage, ctx.PageSize)
+	logErr(err)
+
+	rowCount := getUint16AtOffset(tablePageHeader, CellCountOffset)
+	fmt.Println(rowCount)
 }
 
 func getTableByName(name string, tables []Table) (*Table, error) {
@@ -395,114 +519,46 @@ func getTableByName(name string, tables []Table) (*Table, error) {
 	return nil, fmt.Errorf("unable to find table: %s", name)
 }
 
-// Assuming single page
-func (t *Table) getRowCount(dbFile *os.File, pageSize uint16) (uint16, error) {
-	header := make([]byte, BTreePageHeaderSize)
+// func getRowCount(table string) (uint16, error) {
 
-	// B-tree page header of a table starts at the RootPage offset
-	_, err := dbFile.ReadAt(header, (t.RootPage-1)*int64(pageSize)) // RootPage is 1 indexed
+// }
+
+func logErr(err error) {
 	if err != nil {
-		return 0, err
+		log.Fatal(err)
+		os.Exit(1)
 	}
-
-	rowCount, err := getValueAtOffset(header, CellCountOffset, 2)
-	if err != nil {
-		return 0, err
-	}
-
-	return rowCount, nil
 }
 
-func (t *Table) getRows(dbFile *os.File, pageSize uint16, selectInfo *SelectInfo) ([]string, error) {
-	cellPointerArray := make([]byte, 2*t.RowsCount)
+// Usage: your_program.sh sample.db .dbinfo
+func main() {
+	dbFilePath := os.Args[1]
+	command := os.Args[2]
 
-	// B-tree page header of a table starts at the RootPage offset
-	rootPageOffset := (t.RootPage - 1) * int64(pageSize) // RootPage is 1 indexed
-	_, err := dbFile.ReadAt(cellPointerArray, rootPageOffset+CellPointerOffset)
-	if err != nil {
-		return nil, err
+	ctx, err := initializeDB(dbFilePath)
+	logErr(err)
+	defer ctx.DBFile.Close()
+
+	command = strings.TrimSpace(command)
+	command = strings.ToLower(command)
+
+	switch {
+	case command == ".dbinfo":
+		// fmt.Fprintln(os.Stderr, "Logs from your program will appear here!")
+		fmt.Printf("database page size: %v\n", ctx.PageSize)
+		fmt.Printf("number of tables: %v\n", len(ctx.Tables))
+
+	case command == ".tables":
+		for _, table := range ctx.Tables {
+			fmt.Printf("%s ", table.Name)
+		}
+		fmt.Println()
+
+	case strings.HasPrefix(command, "select"):
+		handleSelect(ctx, command)
+
+	default:
+		fmt.Println("Unknown command", command)
+		os.Exit(1)
 	}
-
-	cellOffsets := make([]uint16, t.RowsCount)
-	for i := range t.RowsCount {
-		offset, err := getValueAtOffset(cellPointerArray, int(2*i), 2)
-		if err != nil {
-			return nil, err
-		}
-		cellOffsets[i] = offset
-	}
-
-	rows := []string{}
-
-	for _, offset := range cellOffsets {
-		pos := rootPageOffset + int64(offset)
-
-		// Size of the record
-		_, err := readVarint(dbFile, &pos)
-		if err != nil {
-			return nil, err
-		}
-
-		// rowId
-		_, err = readVarint(dbFile, &pos)
-		if err != nil {
-			return nil, err
-		}
-
-		// Record header
-		// Size of record header
-		startOfRecord := pos
-		recordHeaderSize, err := readVarint(dbFile, &pos)
-		if err != nil {
-			return nil, err
-		}
-
-		columnOffset := startOfRecord + recordHeaderSize
-		// println(columnOffset)
-		values := make([]string, len(selectInfo.Columns))
-		var whereCondition bool
-
-		for _, column := range t.Columns {
-			// Serial type for sqlite_schema.type
-			schemaTypeSer, err := readVarint(dbFile, &pos)
-			if err != nil {
-				return nil, err
-			}
-			schemaTypeSize := getSerialTypeContentSize(schemaTypeSer)
-			// fmt.Printf("Column: %s, schemaType: %v, schemaTypeSize: %d\n", column.Name, schemaTypeSer, schemaTypeSize)
-
-			valueBytes := make([]byte, schemaTypeSize)
-			_, err = dbFile.ReadAt(valueBytes, columnOffset)
-			if err != nil {
-				return nil, err
-			}
-
-			if column.Type == "integer" {
-				valueInt := bytesToInt(valueBytes)
-				column.ValueStr = strconv.Itoa(int(valueInt))
-			} else if column.Type == "text" {
-				column.ValueStr = string(valueBytes)
-			}
-
-			if column.Name == selectInfo.WhereColumn {
-				if strings.EqualFold(column.ValueStr, selectInfo.WhereValue) {
-					whereCondition = true
-				}
-			}
-
-			for i, columnName := range selectInfo.Columns {
-				if column.Name == columnName {
-					values[i] = column.ValueStr
-					break
-				}
-			}
-			columnOffset += schemaTypeSize
-		}
-
-		if selectInfo.WhereColumn == "" || whereCondition {
-			rows = append(rows, strings.Join(values, "|"))
-		}
-	}
-
-	return rows, nil
 }
