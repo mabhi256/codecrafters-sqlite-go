@@ -33,15 +33,17 @@ type Table struct {
 }
 
 type Column struct {
-	Name string
-	Type string
+	Name         string
+	Type         string
+	IsPrimaryKey bool
 }
 
 const (
-	DBFileHeaderSize = 100
-	// BTreePageHeaderSize = 8 // 12 for interior
-	PageSizeOffset  = 16
-	CellCountOffset = 3
+	DBFileHeaderSize            = 100
+	BTreeLeafPageHeaderSize     = 8
+	BTreeInteriorPageHeaderSize = 12
+	PageSizeOffset              = 16
+	CellCountOffset             = 3
 	//CellPointerOffset   = 8 // Assuming no interior pages
 
 	VARINT_CONTINUATION_MASK = 0x80 // 0b1000_0000
@@ -147,6 +149,55 @@ func getBTreePageData(dbFile *os.File, pageNumber int64, pageSize uint16) (*BTre
 	}, nil
 }
 
+func getRowCount(dbFile *os.File, pageNumber int64, pageSize uint16) (int64, error) {
+	pageHeader, err := getBTreePageHeader(dbFile, pageNumber, pageSize)
+	if err != nil {
+		return 0, err
+	}
+
+	cellCount := getUint16AtOffset(pageHeader, CellCountOffset)
+	pageOffset := getPageOffset(pageNumber, pageSize)
+
+	switch len(pageHeader) {
+	case BTreeLeafPageHeaderSize:
+		return int64(cellCount), nil
+	case BTreeInteriorPageHeaderSize:
+		cellPointerArrayOffset := pageOffset + int64(len(pageHeader))
+
+		cellOffsets, err := getCellOffsets(dbFile, cellPointerArrayOffset, cellCount)
+		if err != nil {
+			return 0, err
+		}
+
+		var count int64 = 0
+		for _, cellOffset := range cellOffsets {
+			pos := pageOffset + int64(cellOffset)
+			leftPointer := make([]byte, 4)
+			_, err := dbFile.ReadAt(leftPointer, pos)
+			if err != nil {
+				return 0, err
+			}
+
+			leftPageNumber := binary.BigEndian.Uint32(leftPointer[:])
+			leftCount, err := getRowCount(dbFile, int64(leftPageNumber), pageSize)
+			if err != nil {
+				return 0, err
+			}
+			count += leftCount
+		}
+		rightPageNumber := binary.BigEndian.Uint32(pageHeader[8:])
+		rightCount, err := getRowCount(dbFile, int64(rightPageNumber), pageSize)
+		if err != nil {
+			return 0, err
+		}
+		count += rightCount
+
+		return count, nil
+	default:
+		return 0, err
+	}
+}
+
 func processSchemaPage(dbFile *os.File, pageSize uint16) ([]Table, error) {
 	pageData, err := getBTreePageData(dbFile, 1, pageSize) // Schema is always on page 1
 	if err != nil {
@@ -161,18 +212,71 @@ func processSchemaPage(dbFile *os.File, pageSize uint16) ([]Table, error) {
 	return tables, nil
 }
 
+func getRows(ctx *DBContext, selectInfo *SelectInfo, pageNumber int64, table *Table) ([]string, error) {
+	pageData, err := getBTreePageData(ctx.DBFile, pageNumber, ctx.PageSize)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	cellCount := getUint16AtOffset(pageData.PageHeader, CellCountOffset)
+	pageOffset := getPageOffset(pageNumber, ctx.PageSize)
+
+	switch len(pageData.PageHeader) {
+	case BTreeLeafPageHeaderSize:
+		rows, err := table.fetchTableRows(ctx.DBFile, pageData, selectInfo)
+		if err != nil {
+			log.Fatal(err)
+		}
+		return rows, nil
+	case BTreeInteriorPageHeaderSize:
+		cellPointerArrayOffset := pageOffset + int64(len(pageData.PageHeader))
+
+		cellOffsets, err := getCellOffsets(ctx.DBFile, cellPointerArrayOffset, cellCount)
+		if err != nil {
+			return nil, err
+		}
+
+		rows := []string{}
+		for _, cellOffset := range cellOffsets {
+			pos := pageOffset + int64(cellOffset)
+			leftPointer := make([]byte, 4)
+			_, err := ctx.DBFile.ReadAt(leftPointer, pos)
+			if err != nil {
+				return nil, err
+			}
+			// pos += 4
+			// key, err := readVarint(dbFile, &pos) // will be used when reading select stmt rows
+			// if err != nil {
+			// 	return 0, err
+			// }
+			leftPageNumber := binary.BigEndian.Uint32(leftPointer[:])
+			leftRows, err := getRows(ctx, selectInfo, int64(leftPageNumber), table)
+			if err != nil {
+				return nil, err
+			}
+			rows = append(rows, leftRows...)
+		}
+		rightPageNumber := binary.BigEndian.Uint32(pageData.PageHeader[8:])
+		rightRows, err := getRows(ctx, selectInfo, int64(rightPageNumber), table)
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, rightRows...)
+
+		return rows, nil
+	default:
+		// Should not happen, BTree header can only be 8 or 12 bytes
+		return nil, err
+	}
+}
+
 func handleSelectRows(ctx *DBContext, selectInfo *SelectInfo) {
 	table, err := getTableByName(selectInfo.TableName, ctx.Tables)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	pageData, err := getBTreePageData(ctx.DBFile, table.RootPage, ctx.PageSize)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	rows, err := table.fetchTableRows(ctx.DBFile, pageData, selectInfo)
+	rows, err := getRows(ctx, selectInfo, table.RootPage, table)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -210,7 +314,8 @@ func readCell(dbFile *os.File,
 	if err != nil {
 		return nil, err
 	}
-	_, err = readVarint(dbFile, &pos) // rowId
+
+	rowId, err := readVarint(dbFile, &pos)
 	if err != nil {
 		return nil, err
 	}
@@ -260,11 +365,13 @@ func readCell(dbFile *os.File,
 			continue
 		}
 
-		value, err := readColumnValue(dbFile, columnOffsets[colIndex], serialTypes[colIndex])
-		if err != nil {
-			return nil, err
+		if serialTypes[colIndex] != 0 {
+			value, err := readColumnValue(dbFile, columnOffsets[colIndex], serialTypes[colIndex])
+			if err != nil {
+				return nil, err
+			}
+			result[requestedCol] = value
 		}
-		result[requestedCol] = value
 	}
 
 	// Apply WHERE filter
@@ -273,6 +380,8 @@ func readCell(dbFile *os.File,
 			return nil, nil // filtered out - return empty map
 		}
 	}
+
+	result["id"] = fmt.Sprintf("%d", rowId)
 
 	return result, nil
 }
@@ -502,10 +611,11 @@ func handleSelectCount(ctx *DBContext, selectInfo *SelectInfo) {
 		log.Fatal(err)
 	}
 
-	tablePageHeader, err := getBTreePageHeader(ctx.DBFile, table.RootPage, ctx.PageSize)
-	logErr(err)
+	rowCount, err := getRowCount(ctx.DBFile, table.RootPage, ctx.PageSize)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	rowCount := getUint16AtOffset(tablePageHeader, CellCountOffset)
 	fmt.Println(rowCount)
 }
 
@@ -552,7 +662,6 @@ func main() {
 		for _, table := range ctx.Tables {
 			fmt.Printf("%s ", table.Name)
 		}
-		fmt.Println()
 
 	case strings.HasPrefix(command, "select"):
 		handleSelect(ctx, command)

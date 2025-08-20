@@ -20,6 +20,8 @@ func convertSQLiteToMySQL(sql string) string {
 }
 
 func (t *Table) ParseCreateTable(command string) error {
+	// remove double quotes in create statement
+	command = strings.ReplaceAll(command, "\"", "")
 	command = convertSQLiteToMySQL(command)
 	stmt, err := sqlparser.Parse(command)
 	if err != nil {
@@ -35,8 +37,9 @@ func (t *Table) ParseCreateTable(command string) error {
 		for _, col := range ddl.TableSpec.Columns {
 			colName := col.Name.String()
 			t.Columns = append(t.Columns, Column{
-				Name: colName,
-				Type: col.Type.Type,
+				Name:         colName,
+				Type:         col.Type.Type,
+				IsPrimaryKey: col.Type.KeyOpt == 1, // ColumnKeyOption value colKeyPrimary
 			})
 		}
 	}
