@@ -13,9 +13,10 @@ import (
 )
 
 type DBContext struct {
-	DBFile   *os.File
-	PageSize uint16
-	Tables   []Table
+	DBFile      *os.File
+	PageSize    uint16
+	UsableSpace uint16
+	Tables      []Table
 }
 
 type BTreePageData struct {
@@ -43,6 +44,7 @@ const (
 	BTreeLeafPageHeaderSize     = 8
 	BTreeInteriorPageHeaderSize = 12
 	PageSizeOffset              = 16
+	ReservedSpaceOffset         = 20
 	CellCountOffset             = 3
 	//CellPointerOffset   = 8 // Assuming no interior pages
 
@@ -64,18 +66,27 @@ func initializeDB(dbFilePath string) (*DBContext, error) {
 	}
 
 	pageSize := getUint16AtOffset(dbFileHeader, PageSizeOffset)
+	reservedSpace := uint16(dbFileHeader[ReservedSpaceOffset])
+	usableSpace := pageSize - reservedSpace
 
-	tables, err := processSchemaPage(dbFile, pageSize)
+	ctx := &DBContext{
+		DBFile:      dbFile,
+		PageSize:    pageSize,
+		UsableSpace: usableSpace,
+	}
+
+	pageData, err := getBTreePageData(ctx.DBFile, 1, ctx.PageSize) // Schema is always on page 1
 	if err != nil {
-		dbFile.Close()
 		return nil, err
 	}
 
-	return &DBContext{
-		DBFile:   dbFile,
-		PageSize: pageSize,
-		Tables:   tables,
-	}, nil
+	tables, err := parseSchemaEntries(ctx, pageData.CellOffsets)
+	if err != nil {
+		return nil, err
+	}
+	ctx.Tables = tables
+
+	return ctx, nil
 }
 
 func getDBFileHeader(dbFile *os.File) ([]byte, error) {
@@ -198,20 +209,6 @@ func getRowCount(dbFile *os.File, pageNumber int64, pageSize uint16) (int64, err
 	}
 }
 
-func processSchemaPage(dbFile *os.File, pageSize uint16) ([]Table, error) {
-	pageData, err := getBTreePageData(dbFile, 1, pageSize) // Schema is always on page 1
-	if err != nil {
-		return nil, err
-	}
-
-	tables, err := parseSchemaEntries(dbFile, pageData.CellOffsets)
-	if err != nil {
-		return nil, err
-	}
-
-	return tables, nil
-}
-
 func getRows(ctx *DBContext, selectInfo *SelectInfo, pageNumber int64, table *Table) ([]string, error) {
 	pageData, err := getBTreePageData(ctx.DBFile, pageNumber, ctx.PageSize)
 	if err != nil {
@@ -223,7 +220,7 @@ func getRows(ctx *DBContext, selectInfo *SelectInfo, pageNumber int64, table *Ta
 
 	switch len(pageData.PageHeader) {
 	case BTreeLeafPageHeaderSize:
-		rows, err := table.fetchTableRows(ctx.DBFile, pageData, selectInfo)
+		rows, err := table.fetchTableRows(ctx, pageData, selectInfo)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -304,45 +301,150 @@ func getCellOffsets(dbFile *os.File,
 	return cellOffsets, nil
 }
 
-func readCell(dbFile *os.File,
+func readCell(ctx *DBContext,
 	cellOffset int64, columns []Column, selectInfo *SelectInfo,
 ) (map[string]string, error) {
-	pos := cellOffset
+	U := int64(ctx.UsableSpace)
+
+	// First, read enough bytes to get payload size and rowId (max 18 bytes for two varints)
+	cellHeaderBuffer := make([]byte, 18)
+	_, err := ctx.DBFile.ReadAt(cellHeaderBuffer, cellOffset)
+	if err != nil {
+		return nil, err
+	}
 
 	// Cell structure: record size + rowid + record data
-	_, err := readVarint(dbFile, &pos) // record size
+	pos := 0
+	P, err := readVarintFromBuffer(cellHeaderBuffer, &pos) // payload size
 	if err != nil {
 		return nil, err
 	}
 
-	rowId, err := readVarint(dbFile, &pos)
+	rowId, err := readVarintFromBuffer(cellHeaderBuffer, &pos)
 	if err != nil {
 		return nil, err
 	}
 
-	// Record structure: header size + column-wise serial types  + column-wise data
+	// Calculate where payload data starts
+	payloadStartOffset := cellOffset + int64(pos)
+
+	// Calculate overflow parameters
+	X := U - 35 // Maximum payload without spilling onto an overflow page
+	M := ((U - 12) * 32 / 255) - 23
+
+	var completePayload []byte
+
+	if P <= X {
+		// No overflow - read all payload directly
+		completePayload = make([]byte, P)
+		_, err = ctx.DBFile.ReadAt(completePayload, payloadStartOffset)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// Overflow case - need to read from multiple locations
+		K := M + ((P - M) % (U - 4))
+
+		var localPayloadSize int64
+		if K <= X {
+			localPayloadSize = K
+		} else {
+			localPayloadSize = M
+		}
+
+		// Read local payload portion
+		localPayload := make([]byte, localPayloadSize)
+		_, err = ctx.DBFile.ReadAt(localPayload, payloadStartOffset)
+		if err != nil {
+			return nil, err
+		}
+
+		// Read overflow page number (4 bytes after local payload)
+		overflowPageBytes := make([]byte, 4)
+		_, err = ctx.DBFile.ReadAt(overflowPageBytes, payloadStartOffset+localPayloadSize)
+		if err != nil {
+			return nil, err
+		}
+		overflowPageNum := binary.BigEndian.Uint32(overflowPageBytes)
+
+		// Read remaining payload from overflow pages
+		remainingPayload, err := readOverflowPages(ctx, overflowPageNum, P-localPayloadSize)
+		if err != nil {
+			return nil, err
+		}
+
+		// Combine local and overflow payload
+		completePayload = append(localPayload, remainingPayload...)
+	}
+
+	// Now parse the record from complete payload
+	return parseRecordFromPayload(completePayload, rowId, columns, selectInfo)
+}
+
+func readOverflowPages(ctx *DBContext, firstOverflowPage uint32, remainingBytes int64) ([]byte, error) {
+	var overflowPayload []byte
+	currentPageNum := firstOverflowPage
+	bytesLeftToRead := remainingBytes
+
+	for currentPageNum != 0 && bytesLeftToRead > 0 {
+		pageOffset := getPageOffset(int64(currentPageNum), ctx.PageSize)
+
+		// Read the 4-byte next page pointer first
+		nextPageBytes := make([]byte, 4)
+		_, err := ctx.DBFile.ReadAt(nextPageBytes, pageOffset)
+		if err != nil {
+			return nil, err
+		}
+		nextPageNum := binary.BigEndian.Uint32(nextPageBytes)
+
+		// Calculate how much payload data is available on this page
+		maxOverflowPayload := int64(ctx.UsableSpace) - 4 // subtract 4 bytes for next page pointer
+		payloadAvailable := min(bytesLeftToRead, maxOverflowPayload)
+
+		// Read payload data from this overflow page
+		pagePayload := make([]byte, payloadAvailable)
+		_, err = ctx.DBFile.ReadAt(pagePayload, pageOffset+4) // +4 to skip next page pointer
+		if err != nil {
+			return nil, err
+		}
+
+		overflowPayload = append(overflowPayload, pagePayload...)
+		bytesLeftToRead -= payloadAvailable
+		currentPageNum = nextPageNum
+	}
+
+	if bytesLeftToRead > 0 {
+		return nil, fmt.Errorf("incomplete overflow chain: still need %d bytes", bytesLeftToRead)
+	}
+
+	return overflowPayload, nil
+}
+
+func parseRecordFromPayload(payload []byte, rowId int64, columns []Column, selectInfo *SelectInfo) (map[string]string, error) {
+	pos := 0
+
+	// Record structure: header size + column-wise serial types + column-wise data
 	startOfRecord := pos
-	recordHeaderSize, err := readVarint(dbFile, &pos)
+	recordHeaderSize, err := readVarintFromBuffer(payload, &pos)
 	if err != nil {
 		return nil, err
 	}
 
 	// Read serial types for all columns and calculate offsets
 	serialTypes := make([]int64, len(columns))
-	columnOffsets := make([]int64, len(columns))
-	currentOffset := startOfRecord + recordHeaderSize
+	columnOffsets := make([]int, len(columns)) // Changed to []int
+	currentOffset := startOfRecord + int(recordHeaderSize)
 	for i := range columns {
-		serialType, err := readVarint(dbFile, &pos)
+		serialType, err := readVarintFromBuffer(payload, &pos)
 		if err != nil {
 			return nil, err
 		}
 		serialTypes[i] = serialType
-		columnOffsets[i] = currentOffset
-		currentOffset += getContentSizeBySerialType(serialType)
+		columnOffsets[i] = currentOffset // Now both are int
+		currentOffset += int(getContentSizeBySerialType(serialType))
 	}
 
 	// Add where-column to requested columns if not already present in select-columns
-	// select col1, col2 from table1 where col3 = x;
 	requestedColumns := selectInfo.Columns
 	if selectInfo.WhereColumn != "" {
 		found := slices.Contains(selectInfo.Columns, selectInfo.WhereColumn)
@@ -366,7 +468,7 @@ func readCell(dbFile *os.File,
 		}
 
 		if serialTypes[colIndex] != 0 {
-			value, err := readColumnValue(dbFile, columnOffsets[colIndex], serialTypes[colIndex])
+			value, err := readColumnValueFromBuffer(payload, columnOffsets[colIndex], serialTypes[colIndex]) // Now both match
 			if err != nil {
 				return nil, err
 			}
@@ -381,24 +483,18 @@ func readCell(dbFile *os.File,
 		}
 	}
 
-	result["id"] = fmt.Sprintf("%d", rowId)
+	result["id"] = strconv.FormatInt(rowId, 10)
 
 	return result, nil
 }
 
-func readVarint(dbFile *os.File, pos *int64) (int64, error) {
+func readVarintFromBuffer(buffer []byte, pos *int) (int64, error) {
 	var num int64
-	b := make([]byte, 1) // reuse the same buffer
 
-	for i := range MaxVarintBytes {
-		_, err := dbFile.ReadAt(b, *pos)
-		if err != nil {
-			return 0, fmt.Errorf("unable to read varint: %w", err)
-		}
-
-		currentByte := b[0]
+	for i := 0; i < MaxVarintBytes && *pos < len(buffer); i++ {
+		currentByte := buffer[*pos]
 		var value byte
-		if i == 9 {
+		if i == 8 {
 			// all 8 bits of the ninth byte are used for reconstruction
 			value = currentByte
 		} else {
@@ -414,16 +510,17 @@ func readVarint(dbFile *os.File, pos *int64) (int64, error) {
 		}
 	}
 
-	return 0, fmt.Errorf("varint too long: %d bytes", MaxVarintBytes)
+	return 0, fmt.Errorf("varint too long or buffer too short")
 }
 
-func readColumnValue(dbFile *os.File, offset int64, serialType int64) (string, error) {
+func readColumnValueFromBuffer(buffer []byte, offset int, serialType int64) (string, error) {
 	size := getContentSizeBySerialType(serialType)
-	valueBytes := make([]byte, size)
-	_, err := dbFile.ReadAt(valueBytes, offset)
-	if err != nil {
-		return "", err
+
+	if offset+int(size) > len(buffer) {
+		return "", fmt.Errorf("buffer too short for column value")
 	}
+
+	valueBytes := buffer[offset : offset+int(size)]
 
 	value, err := serialTypeToValue(serialType, valueBytes)
 	if err != nil {
@@ -521,7 +618,7 @@ func valueToString(value any) string {
 	}
 }
 
-func parseSchemaEntries(dbFile *os.File, cellOffsets []uint16) ([]Table, error) {
+func parseSchemaEntries(ctx *DBContext, cellOffsets []uint16) ([]Table, error) {
 	sqliteMasterColumns := []Column{
 		{Name: "type", Type: "text"},
 		{Name: "name", Type: "text"},
@@ -538,7 +635,7 @@ func parseSchemaEntries(dbFile *os.File, cellOffsets []uint16) ([]Table, error) 
 
 	var tables []Table
 	for i, offset := range cellOffsets {
-		values, err := readCell(dbFile, int64(offset), sqliteMasterColumns, schemaSelectInfo)
+		values, err := readCell(ctx, int64(offset), sqliteMasterColumns, schemaSelectInfo)
 		if err != nil {
 			return nil, err
 		}
@@ -565,12 +662,12 @@ func parseSchemaEntries(dbFile *os.File, cellOffsets []uint16) ([]Table, error) 
 	return tables, nil
 }
 
-func (t *Table) fetchTableRows(dbFile *os.File, pageData *BTreePageData, selectInfo *SelectInfo) ([]string, error) {
+func (t *Table) fetchTableRows(ctx *DBContext, pageData *BTreePageData, selectInfo *SelectInfo) ([]string, error) {
 	var rows []string
 
 	for _, cellOffset := range pageData.CellOffsets {
 		offset := pageData.PageOffset + int64(cellOffset)
-		values, err := readCell(dbFile, offset, t.Columns, selectInfo)
+		values, err := readCell(ctx, offset, t.Columns, selectInfo)
 		if err != nil {
 			return nil, err
 		}
