@@ -9,11 +9,10 @@ import (
 )
 
 func convertSQLiteToMySQL(sql string) string {
-	// Convert AUTOINCREMENT to AUTO_INCREMENT
-	sql = regexp.MustCompile(`(?i)\bautoincrement\b`).ReplaceAllString(sql, "")
-
-	// Normalize whitespace
-	sql = regexp.MustCompile(`\s+`).ReplaceAllString(sql, " ")
+	sql = strings.ReplaceAll(sql, "autoincrement", "")
+	sql = strings.ReplaceAll(sql, "\"", "")
+	sql = strings.ReplaceAll(sql, "range", "")
+	sql = regexp.MustCompile(`\s+`).ReplaceAllString(sql, " ") // Normalize whitespace
 	sql = strings.TrimSpace(sql)
 
 	return sql
@@ -21,8 +20,8 @@ func convertSQLiteToMySQL(sql string) string {
 
 func (t *Table) ParseCreateTable(command string) error {
 	// remove double quotes in create statement
-	command = strings.ReplaceAll(command, "\"", "")
 	command = convertSQLiteToMySQL(command)
+
 	stmt, err := sqlparser.Parse(command)
 	if err != nil {
 		fmt.Println("unable to parse sql query: %w", &err)
@@ -43,6 +42,28 @@ func (t *Table) ParseCreateTable(command string) error {
 			})
 		}
 	}
+
+	return nil
+}
+
+func (i *Index) ParseCreateIndex(command string) error {
+	command = convertSQLiteToMySQL(command)
+
+	// Check if unique
+	i.IsUnique = strings.Contains(strings.ToUpper(command), "CREATE UNIQUE INDEX")
+
+	// Pattern: CREATE [UNIQUE] INDEX index_name ON table_name (column_name)
+	pattern := `(?i)CREATE\s+(?:UNIQUE\s+)?INDEX\s+(\w+)\s+ON\s+(\w+)\s*\(\s*(\w+)\s*\)`
+	re := regexp.MustCompile(pattern)
+	matches := re.FindStringSubmatch(command)
+
+	if len(matches) != 4 {
+		return fmt.Errorf("unable to parse CREATE INDEX statement: %s", command)
+	}
+
+	i.Name = matches[1]       // idx_companies_country
+	i.TableName = matches[2]  // companies
+	i.ColumnName = matches[3] // country
 
 	return nil
 }
